@@ -138,8 +138,8 @@ void mqtt_client::on_message(const struct mosquitto_message *message)
             std::cout << "set the physical pin : "<< outputPin << " with the value : "<<outputValue<<std:: endl;
             Registers inputConf;
             inputConf[0]=I2C_OUTPUT_REGISTERS_SET;
-            inputConf[1]=outputValue;
-            inputConf[2]=outputPin;
+            inputConf[1]=outputPin;
+            inputConf[2]=outputValue;
             int ret = helper_i2c_dimmer_set(device, inputConf);
         }
     }
