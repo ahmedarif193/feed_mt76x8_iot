@@ -23,7 +23,7 @@ define Package/trailling-edge-dimmer
 	TITLE:=Some other dummy application.
 	URL:=https://www.example.com
 	SUBMENU:=Utils
-	DEPENDS:= +libstdcpp +mosquitto-ssl +jsoncpp +libi2c-amaork +libmosquitto-ssl +libmosquittopp +mosquitto +@KERNEL_DEVMEM
+	DEPENDS:= +libstdcpp +mosquitto-ssl +jsoncpp +libgpiod +libmosquitto-ssl +libmosquittopp +mosquitto +@KERNEL_DEVMEM
 endef
 
 define Package/trailling-edge-dimmer/description

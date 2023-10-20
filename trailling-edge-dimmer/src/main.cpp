@@ -1,200 +1,366 @@
-/**
-   @brief this code is made in love by Ahmed ARIF
-Embedded Devices & Telecom Engineer
-   email for inquiries : arif193@gmail.com
-*/
 #include <iostream>
-#include <cstring>
 #include <vector>
-#include <array>
-#include <chrono>
 #include <thread>
+#include <mutex>
+#include <atomic>
+#include <chrono>
+#include <time.h>
 
-#include "mqtt.h"
+#include <signal.h>
+#include <gpiod.h> 
 
-/**
-usefull cmds
-i2cdetect -y 0
-i2cset  -y 0 0x0b 0xEF
-i2cget -y 0 0x0b
-to config a demo test
-mosquitto_pub -h broker.hivemq.com -t 'Device/DEVICE1/config' -m '{"version":1,"samplingrate":3600,"config":{"input":[{"id":0,"type":2,"map":0},{"id":1,"type":1,"map":0}]}}'
-*/
-Registers ioRegisters;
-configStruct configstruct;
 
-// Function to write a struct to a file
-void writeToFile(const configStruct& s, const std::string& filename) {
-    std::ofstream file(filename, std::ios::binary);
-    file.write(reinterpret_cast<const char*>(&s), sizeof(configStruct));
-    file.close();
-}
 
-// Function to read a struct from a file
-configStruct readFromFile(const std::string& filename) {
-    configStruct s;
-    std::ifstream file(filename, std::ios::binary);
-    if(file.good()){
-        file.read(reinterpret_cast<char*>(&s), sizeof(configStruct));
-        file.close();
-    }else{
-        throw "no config file found, this might be the first execution of the deamon";
-    }
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <time.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sched.h>
+#include <stdbool.h>
+#define MMAP_PATH  "/dev/mem"
 
-    return s;
-}
+#define RALINK_GPIO_DIR_IN    0
+#define RALINK_GPIO_DIR_OUT   1
 
-I2CDevice device;
-std::mutex i2c_mutex;
-std::mutex mqtt_mutex;
+#define RALINK_REG_PIODATA    0x620
+#define RALINK_REG_PIODIR     0x600
+#define RALINK_REG_PIOSET     0x630
+#define RALINK_REG_PIORESET   0x640
 
-int helper_i2c_dimmer_init(I2CDevice &ctx){
-    const std::lock_guard<std::mutex> lock(i2c_mutex);
-    if ((ctx.bus = i2c_open("/dev/i2c-0")) == -1) {
+static const uint32_t RALINK_REG_DATA_OFFSETS[] = { RALINK_REG_PIODATA, RALINK_REG_PIODATA + 0x4, RALINK_REG_PIODATA + 0x8 };
+static const uint32_t RALINK_REG_DIR_OFFSETS[] = { RALINK_REG_PIODIR, RALINK_REG_PIODIR + 0x4, RALINK_REG_PIODIR + 0x8 };
+static const uint32_t RALINK_REG_SET_OFFSETS[] = { RALINK_REG_PIOSET, RALINK_REG_PIOSET + 0x4, RALINK_REG_PIOSET + 0x8 };
+static const uint32_t RALINK_REG_RESET_OFFSETS[] = { RALINK_REG_PIORESET, RALINK_REG_PIORESET + 0x4, RALINK_REG_PIORESET + 0x8 };
 
-        perror("Open i2c bus error");
+static uint8_t* gpio_mmap_reg = NULL;
+static int gpio_mmap_fd = 0;
+
+static int gpio_mmap(void) {
+    if ((gpio_mmap_fd = open(MMAP_PATH, O_RDWR)) < 0) {
+        perror("Failed to open mmap file");
         return -1;
     }
 
-    ctx.addr = 0x3b & 0x3ff;
-    ctx.tenbit = 0;
-    ctx.delay = 10;
-    ctx.flags = 0;
-    ctx.page_bytes = I2C_CONFIG_BYTES_PAGE_SIZE;
-    /* Set this to zero, and using i2c_ioctl_xxxx API will ignore chip internal address */
-    ctx.iaddr_bytes = 0;
-    return 0;
-}
-
-int helper_i2c_dimmer_close(I2CDevice &ctx){
-    const std::lock_guard<std::mutex> lock(i2c_mutex);
-    i2c_close(ctx.bus);
-    return 0;
-}
-
-int helper_i2c_dimmer_set(I2CDevice &ctx, const Registers &data){
-    const std::lock_guard<std::mutex> lock(i2c_mutex);
-    ssize_t ret;
-    ret = i2c_ioctl_write(&ctx, 0x0, data.data(), data.size());
-    if (ret == -1 || (size_t)ret != data.size())
-    {
+    gpio_mmap_reg = (uint8_t*) mmap(NULL, 1024, PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, gpio_mmap_fd, 0x10000000);
+    if (gpio_mmap_reg == MAP_FAILED) {
+        perror("Failed to mmap");
+        gpio_mmap_reg = NULL;
+        close(gpio_mmap_fd);
         return -1;
     }
+
     return 0;
 }
-int helper_i2c_dimmer_get(I2CDevice &ctx, Registers &data){
-    const std::lock_guard<std::mutex> lock(i2c_mutex);
-    uint8_t buff[I2C_CONFIG_BYTES_PAGE_SIZE];
-    ssize_t ret = i2c_ioctl_read(&ctx, 0x0, buff, I2C_CONFIG_BYTES_PAGE_SIZE);
 
-    if (ret == -1 || (size_t)ret != I2C_CONFIG_BYTES_PAGE_SIZE)
-    {
-        return -1;
-    }
-    for (int i = 0; i < I2C_CONFIG_BYTES_PAGE_SIZE; i++) {
-        data[i]=buff[i];
-    }
-    return 0;
+static inline uint32_t get_register_offset(const uint32_t pin, const uint32_t offsets[3]) {
+    return offsets[pin / 32];
 }
-void thread_i2c_routine(int tid) {
-    std::cout << "thread i2c started"<< std::endl;
-    helper_i2c_dimmer_init(device);
-    helper_i2c_dimmer_set(device, configstruct.configRegisters);
 
-    while (1)
-    {
-        helper_i2c_dimmer_get(device, ioRegisters);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-    //TODO: this function part will never be achieved, fix it
-    helper_i2c_dimmer_close(device);
+int mt76x8_gpio_get_pin(int pin) {
+    uint32_t tmp = *(volatile uint32_t *)(gpio_mmap_reg + get_register_offset(pin, RALINK_REG_DATA_OFFSETS));
+    return (tmp >> (pin % 32)) & 1u;
 }
-void thread_publish_io_routine(mqtt_client *iot_client) {
-    std::cout << "thread io started 2"<< std::endl;
-    //    int sampling_rate = 1000;
-    //    {
-    //        const std::lock_guard<std::mutex> lock(mqtt_mutex);
-    //        configstruct.sampling_rate = sampling_rate;
-    //    }
-    //    {
-    //        const std::lock_guard<std::mutex> lock(mqtt_mutex);
-    //        configstruct.sampling_rate = 1000;
-    //    }
-    MqttPublisher publisher(CLIENT_ID, BROKER_ADDRESS, MQTT_PORT);
-    while (true) {
-        Json::Value root;
-        Json::Value inputs(Json::arrayValue);
-        Json::Value outputs(Json::arrayValue);
-        for (int i = 0; i < I2C_CONFIG_BYTES_PAGE_SIZE; i++) {
-            inputs.append(std::to_string(ioRegisters[i]));
+
+void mt76x8_gpio_set_pin_direction(int pin, int is_output) {
+    uint32_t mask = (1u << (pin % 32));
+    volatile uint32_t *reg = (volatile uint32_t *)(gpio_mmap_reg + get_register_offset(pin, RALINK_REG_DIR_OFFSETS));
+    if (is_output) {
+        *reg |= mask;
+    } else {
+        *reg &= ~mask;
+    }
+}
+
+void mt76x8_gpio_set_pin_value(int pin, int value) {
+    uint32_t mask = (1u << (pin % 32));
+    volatile uint32_t *reg = value ? (volatile uint32_t *)(gpio_mmap_reg + get_register_offset(pin, RALINK_REG_SET_OFFSETS))
+                                   : (volatile uint32_t *)(gpio_mmap_reg + get_register_offset(pin, RALINK_REG_RESET_OFFSETS));
+    *reg = mask;
+}
+
+
+struct gpiod_line *sync_line;
+
+struct gpiod_chip *chip;
+std::atomic<bool> run_monitoring(true);
+
+#define SYNC_PIN 3
+#define REG_LOCK_PIN 2
+#define REG_CLK_PIN 1
+#define REG_DATA_PIN 0
+
+#define O0_PIN 14
+#define O1_PIN 15
+#define O2_PIN 16
+#define O3_PIN 17
+#define O4_PIN 20
+#define O5_PIN 21
+#define O6_PIN 22
+#define O7_PIN 23
+
+#define LOW 0
+#define HIGH 1
+
+#define OUTPUT_MULTIPLIER (6000 / 255)
+#define OUTPUT_RISEFALL_MS 5
+
+enum InputType { Rise = 1,
+                 Fall = 2,
+                 Mirror = 3,
+                 Multiway = 4,
+                 None = 5 };
+
+struct ContextOutput {
+  unsigned long value = 0;
+  int pin;
+  bool state;
+};
+struct ContextInput {
+  unsigned long lastchange = 0;
+  bool lastValue = false;
+  bool value = false;
+  int map = 0;
+  InputType type = InputType::None;
+};
+ContextOutput contextOutput[8];
+ContextInput contextInput[8];
+volatile unsigned long pastSyncUs = 0;
+
+unsigned long micros() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000000L + ts.tv_nsec / 1000L; // Convert seconds to microseconds and nanoseconds to microseconds
+}
+unsigned long millis() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L; // Convert seconds to milliseconds and nanoseconds to milliseconds
+}
+
+void HandlerInputSubthread() {
+  static int pos = 0;
+  pos = pos >= 7 ? 0 : pos + 1;
+  switch (contextInput[pos].type) {
+    case InputType::Rise:
+      if (contextInput[pos].value == true) {
+        if (contextInput[pos].lastchange + OUTPUT_RISEFALL_MS < millis()) {
+          contextInput[pos].lastchange = millis();
+          auto mmap = contextInput[pos].map;
+          if (mmap > -1) {
+            if (contextOutput[mmap].value < 254)
+              contextOutput[mmap].value += 1;
+          }
         }
-        root["inputs"] = inputs;
-        root["outputs"] = outputs;
-        Json::FastWriter writer;
-        std::string json_string = writer.write(root);
-        iot_client->publishMessage(PUBLISH_IO_TOPIC, json_string);
-        //std::cout << "message" <<root<< std::endl;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        //const std::lock_guard<std::mutex> lock(mqtt_mutex);
-    }
-    publisher.disconnect();
+      }
+      break;
+    case InputType::Fall:
+      if (contextInput[pos].value == true) {
+        if (contextInput[pos].lastchange + OUTPUT_RISEFALL_MS < millis()) {
+          contextInput[pos].lastchange = millis();
+          auto mmap = contextInput[pos].map;
+          if (mmap > -1) {
+            if (contextOutput[mmap].value > 1)
+              contextOutput[mmap].value -= 1;
+          }
+        }
+      }
+      break;
+    case InputType::Mirror:
+      {
+        auto mmap = contextInput[pos].map;
+        contextOutput[mmap].value = contextInput[pos].value ? 255 : 0;
+      }
+      break;
+    case InputType::Multiway:
+      if (contextInput[pos].lastValue != contextInput[pos].value) {
+
+        contextInput[pos].lastValue = contextInput[pos].value;
+
+        auto mmap = contextInput[pos].map;
+        if (contextOutput[mmap].value > 250)
+          contextOutput[mmap].value = 0;
+        else
+          contextOutput[mmap].value = 255;
+      }
+      break;
+  }
 }
+void HAL_input_subthread() {
+    static int pos = 0;
+    constexpr char HAL_INPUT_MIRROR[] = { 3, 2, 1, 0, 7, 6, 5, 4 };
+    
+    {
+        contextInput[HAL_INPUT_MIRROR[pos]].value = mt76x8_gpio_get_pin(REG_DATA_PIN);
 
-void thread_mqtt_routine(int tid) {
-    std::cout << "thread mqtt started"<< std::endl;
-    class mqtt_client *iot_client;
-    std::thread thread_publish_io;
-    mosqpp::lib_init();
-
-    iot_client = new mqtt_client(CLIENT_ID, BROKER_ADDRESS, MQTT_PORT);
-    auto ret = iot_client->subscribe(NULL, MQTT_TOPIC);
-    //iot_client->threaded_set(true);
-    thread_publish_io = std::thread(thread_publish_io_routine, iot_client);
-    while (1) {
-        int ret = iot_client->loop();
-        if(ret){
-            iot_client->reconnect();
-            iot_client->subscribe(NULL, MQTT_TOPIC);
+        pos = pos >= 7 ? 0 : pos + 1;
+        
+        mt76x8_gpio_set_pin_value(REG_CLK_PIN, 1);
+        mt76x8_gpio_set_pin_value(REG_CLK_PIN, 0);
+        if (pos == 0) {
+            mt76x8_gpio_set_pin_value(REG_CLK_PIN, 0);
+            mt76x8_gpio_set_pin_value(REG_CLK_PIN, 1);
         }
     }
-    //    while (true)
-    //    {
-    //        if (!iot_client->is_connected())
-    //        {
-    //            iot_client->reconnect();
-    //        }
-
-    //        int ret = client.loop();
-    //        if (ret != MOSQ_ERR_SUCCESS)
-    //        {
-    //            std::cout << "Error in client loop. Return code: " << ret << std::endl;
-    //            client.reconnect();
-    //        }
-    //    }
-    thread_publish_io.join();
-    mosqpp::lib_cleanup();
 }
-int main()
-{
-    std::cout<<"tedd boot"<<std::endl;
-    try {
-        configstruct =  readFromFile(CONFIG_FILE);
-    }  catch (...) {
-        std::cout<<"no config file found in " CONFIG_FILE ", this might be the first execution of the deamon"<<std::endl;
-    }
-#ifdef __mips__
-    auto thread_i2c = std::thread(thread_i2c_routine, 1);
-#endif
-    auto thread_mqtt = std::thread(thread_mqtt_routine, 1);
-    while (1)
-    {
-    }
-#ifdef __mips__
-    //thread_i2c.join();
-#endif
 
-    thread_mqtt.join();
+void syncContext2Output() {
+    auto currentUs = micros();
+    for (int i = 0; i < 8; i++) {
+        if (contextOutput[i].state == HIGH) {
+            if (currentUs >= pastSyncUs + (contextOutput[i].value * OUTPUT_MULTIPLIER)) {
+                contextOutput[i].state = LOW;
+
+                // Set the contextOutput[i].pin's value using libgpiod
+                mt76x8_gpio_set_pin_value(contextOutput[i].pin, contextOutput[i].state);
+            }
+        }
+    }
+}
+
+void zeroCrossCb() {
+    int val = gpiod_line_get_value(sync_line);
+
+    if (val == 1) {
+        for (int i = 0; i < 8; i++) {
+            auto mmap = contextInput[i].map;
+            if (mmap > -1) {
+                contextOutput[mmap].state = HIGH;
+                mt76x8_gpio_set_pin_value(contextOutput[mmap].pin, contextOutput[mmap].state);
+            }
+        }
+    }
+}
+#define DEBUG 1  // Set to 1 to enable debug prints, 0 to disable
+
+void sync_pin_monitoring_thread() {
+    unsigned long lastRiseTimeMillis = 0;
+    unsigned long lastRiseTimeMicros = 0;
+    int previous_val = -1; // Start with an invalid value to capture the initial state
+
+    while (run_monitoring) {
+        int val = gpiod_line_get_value(sync_line);
+        
+        if (val == 1 && previous_val != 1) {
+#if DEBUG
+            unsigned long currentTimeMillis = millis();
+            unsigned long currentTimeMicros = micros();
+
+            if (lastRiseTimeMillis != 0) {  // Avoiding the initial condition
+                unsigned long latencyMillis = currentTimeMillis - lastRiseTimeMillis;
+                unsigned long latencyMicros = currentTimeMicros - lastRiseTimeMicros;
+
+                float frequency = 1000.0f / latencyMillis;  // Since latencyMillis is in milliseconds
+
+                std::cout << "Pulse Frequency: " << frequency << " Hz" << std::endl;
+                std::cout << "Latency in milliseconds: " << latencyMillis << " ms" << std::endl;
+                std::cout << "Latency in microseconds: " << latencyMicros << " µs" << std::endl;
+            }
+
+            lastRiseTimeMillis = currentTimeMillis;
+            lastRiseTimeMicros = currentTimeMicros;
+#endif
+        }
+        else if (val == 0 && previous_val == 1) { // Detecting fall transition (1 to 0)
+            zeroCrossCb();
+        }
+
+        previous_val = val; // Store the current value for the next iteration
+        std::this_thread::sleep_for(std::chrono::microseconds(500));  // Sleep for a short while before checking again. Adjust sleep time as necessary.
+    }
+}
+
+void setup_libgpiod() {
+    mt76x8_gpio_set_pin_direction(REG_LOCK_PIN, RALINK_GPIO_DIR_OUT);
+    mt76x8_gpio_set_pin_direction(REG_CLK_PIN, RALINK_GPIO_DIR_OUT);
+    mt76x8_gpio_set_pin_direction(REG_DATA_PIN, RALINK_GPIO_DIR_IN);
+
+    sync_line = gpiod_chip_get_line(chip, SYNC_PIN);
+    if (!sync_line) {
+        std::cerr << "Failed to get SYNC_PIN line" << std::endl;
+        goto exit_error_setup;
+    }
+    gpiod_line_request_input(sync_line, "interrupt");
+
+    // Initialize output lines
+    for (int i = 0; i < 8; i++) {
+        mt76x8_gpio_set_pin_direction(contextOutput[i].pin, RALINK_GPIO_DIR_OUT);
+    }
+
+    // Setting REG_CLK_PIN to LOW
+    mt76x8_gpio_set_pin_value(REG_CLK_PIN, 0);
+
+    // Setting REG_LOCK_PIN to HIGH
+    mt76x8_gpio_set_pin_value(REG_LOCK_PIN, 1);
+
+    return;  // Successfully initialized
+
+exit_error_setup:
+    gpiod_chip_close(chip);
+    exit(1); // or handle error appropriately
+}
+
+void sigint_handler(int signo) {
+    if (signo == SIGINT) {
+        run_monitoring = false;
+    }
+}
+void setThreadPriority(std::thread &thread, int priority) {
+    sched_param sch_params;
+    sch_params.sched_priority = priority;
+
+    if(pthread_setschedparam(thread.native_handle(), SCHED_FIFO, &sch_params)) {
+        std::cerr << "Failed to set thread priority" << std::endl;
+    }
+}
+
+int main() {
+    gpio_mmap();
+    if (signal(SIGINT, sigint_handler) == SIG_ERR) {
+        std::cerr << "Failed to set up signal handler" << std::endl;
+        exit(1);
+    }
+
+    chip = gpiod_chip_open_by_name("gpiochip0");
+    if (!chip) {
+        std::cerr << "Failed to open GPIO chip" << std::endl;
+        exit(1); // or handle error appropriately
+    }
+    setup_libgpiod();
+
+    contextOutput[0].pin = O0_PIN;
+    contextOutput[1].pin = O1_PIN;
+    contextOutput[2].pin = O2_PIN;
+    contextOutput[3].pin = O3_PIN;
+    contextOutput[4].pin = O4_PIN;
+    contextOutput[5].pin = O5_PIN;
+    contextOutput[6].pin = O6_PIN;
+    contextOutput[7].pin = O7_PIN;
+
+    contextInput[0].type = InputType::Rise;
+    contextInput[0].map = 0;
+    contextInput[1].type = InputType::Fall;
+    contextInput[1].map = 0;
+
+    contextInput[2].type = InputType::Multiway;
+    contextInput[2].map = 1;
+    contextInput[3].type = InputType::Multiway;
+    contextInput[3].map = 1;
+    
+    std::thread sync_monitor_thread(sync_pin_monitoring_thread);
+    setThreadPriority(sync_monitor_thread, 5);  
+    
+    while (run_monitoring) {
+        HAL_input_subthread();
+        HandlerInputSubthread();
+        syncContext2Output();
+    }
+
+    sync_monitor_thread.join();
+    gpiod_line_release(sync_line);
+    gpiod_chip_close(chip);
     return 0;
-
 }
 

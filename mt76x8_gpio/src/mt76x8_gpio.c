@@ -177,6 +177,10 @@ int main(int argc, char **argv) {
 
     // Loop to toggle GPIO state with a delay.
     while (1) {
+        mt76x8_gpio_set_pin_value(3, 0);
+        sleep(1);
+        mt76x8_gpio_set_pin_value(3, 1);
+        sleep(1);
     }
 
     // Cleanup and exit.
