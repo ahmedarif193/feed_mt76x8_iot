@@ -95,50 +95,6 @@ void getinfo ()
               param.sched_priority, policy, SCHED_FIFO);
 }
 
-// IRQ Handler function.
-void gpio_irq_handler(int pin) {
-    struct timespec curr_timestamp;
-    clock_gettime(CLOCK_MONOTONIC_RAW, &curr_timestamp);
-
-    // Calculate the time difference and then subtract 1 second (in nanoseconds).
-    long diff_in_ns = (curr_timestamp.tv_sec - prev_timestamp.tv_sec) * 1e9 + 
-                      (curr_timestamp.tv_nsec - prev_timestamp.tv_nsec) - 1e9; // Subtracting 1 second.
-
-    prev_timestamp = curr_timestamp; // Update the previous timestamp to the current one before displaying.
-
-    printf("Latency from expected 1 second: %ld ns\n", diff_in_ns);
-}
-
-// Thread function to monitor GPIO pin state.
-void* pin_monitor_thread(void* arg) {
-    struct sched_param param;
-
-    // Lock memory to ensure no swapping is done.
-    if(mlockall(MCL_CURRENT|MCL_FUTURE) == -1) {
-        perror("mlockall failed");
-        return -1;
-    }
-
-    // Set real-time priority to the main thread
-    param.sched_priority = 50; // Mid range priority, adjust as needed
-    if(pthread_setschedparam(pthread_self(), SCHED_FIFO, &param) == -1) {
-        perror("pthread_setschedparam failed");
-        return -1;
-    }
-	getinfo ();
-    PinMonitor* monitor = (PinMonitor*)arg;
-
-    while (running) {
-        int currentState = mt76x8_gpio_get_pin(monitor->pin);
-        if (currentState != monitor->lastState) {
-            gpio_irq_handler(monitor->pin);
-            monitor->lastState = currentState;
-        }
-    }
-
-    return NULL;
-}
-
 int main(int argc, char **argv) {
     if (gpio_mmap()) {
         return -1;
@@ -162,24 +118,21 @@ int main(int argc, char **argv) {
     param.sched_priority = sched_get_priority_max(SCHED_FIFO);
     pthread_attr_setschedparam(&attr, &param);
 	getinfo ();
-    // Starting the pin monitor thread.
-    pthread_t thread;
-    pthread_create(&thread, &attr, pin_monitor_thread, &monitor);
-
     // Printing GPIO states for pins 39 to 42.
     for (int i = 39; i <= 42; i++) {
         printf("get pin %d input %d\n", i, mt76x8_gpio_get_pin(i));
     }
-
-    // Configuring pin 2 for output and setting initial value.
-    mt76x8_gpio_set_pin_direction(3, RALINK_GPIO_DIR_OUT);
-    mt76x8_gpio_set_pin_value(3, 0);
-
+#define PIN 42
     // Loop to toggle GPIO state with a delay.
+    for (int i = 0; i <= 42; i++)
+    mt76x8_gpio_set_pin_direction(i, RALINK_GPIO_DIR_OUT);
+
     while (1) {
-        mt76x8_gpio_set_pin_value(3, 0);
+        for (int i = 0; i <= 42; i++)
+        mt76x8_gpio_set_pin_value(i, 0);
         sleep(1);
-        mt76x8_gpio_set_pin_value(3, 1);
+        for (int i = 0; i <= 42; i++)
+        mt76x8_gpio_set_pin_value(i, 1);
         sleep(1);
     }
 

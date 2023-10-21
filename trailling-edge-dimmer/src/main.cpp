@@ -1,25 +1,18 @@
 #include <iostream>
 #include <vector>
 #include <thread>
-#include <mutex>
 #include <atomic>
 #include <chrono>
-#include <time.h>
 
-#include <signal.h>
 #include <gpiod.h> 
 
-
-
-#include <stdio.h>
 #include <stdint.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <time.h>
-#include <pthread.h>
+#include <signal.h>
 #include <unistd.h>
-#include <sched.h>
-#include <stdbool.h>
+
 #define MMAP_PATH  "/dev/mem"
 
 #define RALINK_GPIO_DIR_IN    0
@@ -29,6 +22,27 @@
 #define RALINK_REG_PIODIR     0x600
 #define RALINK_REG_PIOSET     0x630
 #define RALINK_REG_PIORESET   0x640
+
+#define SYNC_PIN 3
+#define REG_LOCK_PIN 2
+#define REG_CLK_PIN 1
+#define REG_DATA_PIN 0
+
+#define O0_PIN 42
+#define O1_PIN 41
+#define O2_PIN 16
+#define O3_PIN 17
+#define O4_PIN 20
+#define O5_PIN 21
+#define O6_PIN 22
+#define O7_PIN 23
+
+#define LOW 0
+#define HIGH 1
+#define DEBUG 1
+
+#define OUTPUT_MULTIPLIER (6000 / 255)
+#define OUTPUT_RISEFALL_MS 5
 
 static const uint32_t RALINK_REG_DATA_OFFSETS[] = { RALINK_REG_PIODATA, RALINK_REG_PIODATA + 0x4, RALINK_REG_PIODATA + 0x8 };
 static const uint32_t RALINK_REG_DIR_OFFSETS[] = { RALINK_REG_PIODIR, RALINK_REG_PIODIR + 0x4, RALINK_REG_PIODIR + 0x8 };
@@ -54,16 +68,13 @@ static int gpio_mmap(void) {
 
     return 0;
 }
-
 static inline uint32_t get_register_offset(const uint32_t pin, const uint32_t offsets[3]) {
     return offsets[pin / 32];
 }
-
 int mt76x8_gpio_get_pin(int pin) {
     uint32_t tmp = *(volatile uint32_t *)(gpio_mmap_reg + get_register_offset(pin, RALINK_REG_DATA_OFFSETS));
     return (tmp >> (pin % 32)) & 1u;
 }
-
 void mt76x8_gpio_set_pin_direction(int pin, int is_output) {
     uint32_t mask = (1u << (pin % 32));
     volatile uint32_t *reg = (volatile uint32_t *)(gpio_mmap_reg + get_register_offset(pin, RALINK_REG_DIR_OFFSETS));
@@ -73,7 +84,6 @@ void mt76x8_gpio_set_pin_direction(int pin, int is_output) {
         *reg &= ~mask;
     }
 }
-
 void mt76x8_gpio_set_pin_value(int pin, int value) {
     uint32_t mask = (1u << (pin % 32));
     volatile uint32_t *reg = value ? (volatile uint32_t *)(gpio_mmap_reg + get_register_offset(pin, RALINK_REG_SET_OFFSETS))
@@ -81,31 +91,10 @@ void mt76x8_gpio_set_pin_value(int pin, int value) {
     *reg = mask;
 }
 
-
 struct gpiod_line *sync_line;
 
 struct gpiod_chip *chip;
 std::atomic<bool> run_monitoring(true);
-
-#define SYNC_PIN 3
-#define REG_LOCK_PIN 2
-#define REG_CLK_PIN 1
-#define REG_DATA_PIN 0
-
-#define O0_PIN 14
-#define O1_PIN 15
-#define O2_PIN 16
-#define O3_PIN 17
-#define O4_PIN 20
-#define O5_PIN 21
-#define O6_PIN 22
-#define O7_PIN 23
-
-#define LOW 0
-#define HIGH 1
-
-#define OUTPUT_MULTIPLIER (6000 / 255)
-#define OUTPUT_RISEFALL_MS 5
 
 enum InputType { Rise = 1,
                  Fall = 2,
@@ -140,7 +129,7 @@ unsigned long millis() {
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L; // Convert seconds to milliseconds and nanoseconds to milliseconds
 }
 
-void HandlerInputSubthread() {
+void HandlerInput_sub_routine() {
   static int pos = 0;
   pos = pos >= 7 ? 0 : pos + 1;
   switch (contextInput[pos].type) {
@@ -188,7 +177,7 @@ void HandlerInputSubthread() {
       break;
   }
 }
-void HAL_input_subthread() {
+void HAL_input_sub_routine() {
     static int pos = 0;
     constexpr char HAL_INPUT_MIRROR[] = { 3, 2, 1, 0, 7, 6, 5, 4 };
     
@@ -205,7 +194,6 @@ void HAL_input_subthread() {
         }
     }
 }
-
 void syncContext2Output() {
     auto currentUs = micros();
     for (int i = 0; i < 8; i++) {
@@ -219,7 +207,6 @@ void syncContext2Output() {
         }
     }
 }
-
 void zeroCrossCb() {
     int val = gpiod_line_get_value(sync_line);
 
@@ -233,12 +220,10 @@ void zeroCrossCb() {
         }
     }
 }
-#define DEBUG 1  // Set to 1 to enable debug prints, 0 to disable
-
 void sync_pin_monitoring_thread() {
     unsigned long lastRiseTimeMillis = 0;
     unsigned long lastRiseTimeMicros = 0;
-    int previous_val = -1; // Start with an invalid value to capture the initial state
+    int previous_val = -1;
 
     while (run_monitoring) {
         int val = gpiod_line_get_value(sync_line);
@@ -248,11 +233,11 @@ void sync_pin_monitoring_thread() {
             unsigned long currentTimeMillis = millis();
             unsigned long currentTimeMicros = micros();
 
-            if (lastRiseTimeMillis != 0) {  // Avoiding the initial condition
+            if (lastRiseTimeMillis != 0) {
                 unsigned long latencyMillis = currentTimeMillis - lastRiseTimeMillis;
                 unsigned long latencyMicros = currentTimeMicros - lastRiseTimeMicros;
 
-                float frequency = 1000.0f / latencyMillis;  // Since latencyMillis is in milliseconds
+                float frequency = 1000.0f / latencyMillis;
 
                 std::cout << "Pulse Frequency: " << frequency << " Hz" << std::endl;
                 std::cout << "Latency in milliseconds: " << latencyMillis << " ms" << std::endl;
@@ -271,7 +256,6 @@ void sync_pin_monitoring_thread() {
         std::this_thread::sleep_for(std::chrono::microseconds(500));  // Sleep for a short while before checking again. Adjust sleep time as necessary.
     }
 }
-
 void setup_libgpiod() {
     mt76x8_gpio_set_pin_direction(REG_LOCK_PIN, RALINK_GPIO_DIR_OUT);
     mt76x8_gpio_set_pin_direction(REG_CLK_PIN, RALINK_GPIO_DIR_OUT);
@@ -301,7 +285,6 @@ exit_error_setup:
     gpiod_chip_close(chip);
     exit(1); // or handle error appropriately
 }
-
 void sigint_handler(int signo) {
     if (signo == SIGINT) {
         run_monitoring = false;
@@ -341,8 +324,10 @@ int main() {
 
     contextInput[0].type = InputType::Rise;
     contextInput[0].map = 0;
+    contextInput[0].value = 200;
     contextInput[1].type = InputType::Fall;
     contextInput[1].map = 0;
+    contextInput[1].value = 200;
 
     contextInput[2].type = InputType::Multiway;
     contextInput[2].map = 1;
@@ -353,9 +338,10 @@ int main() {
     setThreadPriority(sync_monitor_thread, 5);  
     
     while (run_monitoring) {
-        HAL_input_subthread();
-        HandlerInputSubthread();
+        HAL_input_sub_routine();
+        HandlerInput_sub_routine();
         syncContext2Output();
+        std::this_thread::sleep_for(std::chrono::nanoseconds(5)); 
     }
 
     sync_monitor_thread.join();
