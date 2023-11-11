@@ -24,18 +24,18 @@
 #define RALINK_REG_PIORESET   0x640
 
 #define SYNC_PIN 3
-#define REG_LOCK_PIN 2
-#define REG_CLK_PIN 1
-#define REG_DATA_PIN 0
+#define REG_LOCK_PIN 22
+#define REG_CLK_PIN 21
+#define REG_DATA_PIN 20
 
-#define O0_PIN 42
+#define O0_PIN 0
 #define O1_PIN 41
-#define O2_PIN 16
-#define O3_PIN 17
-#define O4_PIN 20
-#define O5_PIN 21
-#define O6_PIN 22
-#define O7_PIN 23
+#define O2_PIN 40
+#define O3_PIN 39
+#define O4_PIN 38
+#define O5_PIN 11
+#define O6_PIN 14
+#define O7_PIN 15
 
 #define LOW 0
 #define HIGH 1
@@ -103,20 +103,21 @@ enum InputType { Rise = 1,
                  None = 5 };
 
 struct ContextOutput {
+  unsigned long lastChanged = 0;
   unsigned long value = 0;
   int pin;
   bool state;
 };
 struct ContextInput {
-  unsigned long lastchange = 0;
+  unsigned long lastChanged = 0;
   bool lastValue = false;
   bool value = false;
-  int map = 0;
+  int map = -1;
   InputType type = InputType::None;
 };
 ContextOutput contextOutput[8];
 ContextInput contextInput[8];
-volatile unsigned long pastSyncUs = 0;
+unsigned long pastSyncUs = 0;
 
 unsigned long micros() {
     struct timespec ts;
@@ -135,8 +136,8 @@ void HandlerInput_sub_routine() {
   switch (contextInput[pos].type) {
     case InputType::Rise:
       if (contextInput[pos].value == true) {
-        if (contextInput[pos].lastchange + OUTPUT_RISEFALL_MS < millis()) {
-          contextInput[pos].lastchange = millis();
+        if (contextInput[pos].lastChanged + OUTPUT_RISEFALL_MS < millis()) {
+          contextInput[pos].lastChanged = millis();
           auto mmap = contextInput[pos].map;
           if (mmap > -1) {
             if (contextOutput[mmap].value < 254)
@@ -147,8 +148,8 @@ void HandlerInput_sub_routine() {
       break;
     case InputType::Fall:
       if (contextInput[pos].value == true) {
-        if (contextInput[pos].lastchange + OUTPUT_RISEFALL_MS < millis()) {
-          contextInput[pos].lastchange = millis();
+        if (contextInput[pos].lastChanged + OUTPUT_RISEFALL_MS < millis()) {
+          contextInput[pos].lastChanged = millis();
           auto mmap = contextInput[pos].map;
           if (mmap > -1) {
             if (contextOutput[mmap].value > 1)
@@ -194,29 +195,36 @@ void HAL_input_sub_routine() {
         }
     }
 }
+unsigned long latencyMicros = 10000;
+
+
 void syncContext2Output() {
     auto currentUs = micros();
+
     for (int i = 0; i < 8; i++) {
         if (contextOutput[i].state == HIGH) {
-            if (currentUs >= pastSyncUs + (contextOutput[i].value * OUTPUT_MULTIPLIER)) {
-                contextOutput[i].state = LOW;
+            unsigned long desiredPulseWidthUs = contextOutput[i].value * (latencyMicros/100);   // calculate pulse width in microseconds
 
-                // Set the contextOutput[i].pin's value using libgpiod
-                mt76x8_gpio_set_pin_value(contextOutput[i].pin, contextOutput[i].state);
+            if (currentUs >= contextOutput[i].lastChanged + desiredPulseWidthUs) {
+                // std::cout << "syncContext2Output : "<<contextOutput[i].pin
+                // << " currentUs : "<< currentUs 
+                // << " expectedChangeAtUsDiff : " << currentUs - contextOutput[i].lastChanged
+                // << " desiredPulseWidthUs : "<< desiredPulseWidthUs
+                // << std::endl;
+                mt76x8_gpio_set_pin_value(contextOutput[i].pin, LOW);
+                contextOutput[i].lastChanged = currentUs;  // update the timestamp for the specific output
             }
         }
     }
 }
 void zeroCrossCb() {
-    int val = gpiod_line_get_value(sync_line);
-
-    if (val == 1) {
-        for (int i = 0; i < 8; i++) {
-            auto mmap = contextInput[i].map;
-            if (mmap > -1) {
-                contextOutput[mmap].state = HIGH;
-                mt76x8_gpio_set_pin_value(contextOutput[mmap].pin, contextOutput[mmap].state);
-            }
+    for (int i = 0; i < 8; i++) {
+        if (contextOutput[i].value > 0) {
+            // std::cout << "zeroCrossCb "<< contextOutput[i].state<< std::endl;
+            contextOutput[i].state = HIGH;
+            mt76x8_gpio_set_pin_value(contextOutput[i].pin, HIGH);
+            std::this_thread::sleep_for(std::chrono::microseconds(8000));
+            mt76x8_gpio_set_pin_value(contextOutput[i].pin, LOW);
         }
     }
 }
@@ -229,19 +237,20 @@ void sync_pin_monitoring_thread() {
         int val = gpiod_line_get_value(sync_line);
         
         if (val == 1 && previous_val != 1) {
+            zeroCrossCb();
 #if DEBUG
             unsigned long currentTimeMillis = millis();
             unsigned long currentTimeMicros = micros();
 
             if (lastRiseTimeMillis != 0) {
                 unsigned long latencyMillis = currentTimeMillis - lastRiseTimeMillis;
-                unsigned long latencyMicros = currentTimeMicros - lastRiseTimeMicros;
+                latencyMicros = currentTimeMicros - lastRiseTimeMicros;
 
                 float frequency = 1000.0f / latencyMillis;
 
-                std::cout << "Pulse Frequency: " << frequency << " Hz" << std::endl;
-                std::cout << "Latency in milliseconds: " << latencyMillis << " ms" << std::endl;
-                std::cout << "Latency in microseconds: " << latencyMicros << " µs" << std::endl;
+                // std::cout << "Pulse Frequency: " << frequency << " Hz" << std::endl;
+                // std::cout << "Latency in milliseconds: " << latencyMillis << " ms" << std::endl;
+                // std::cout << "Latency in microseconds: " << latencyMicros << " µs" << std::endl;
             }
 
             lastRiseTimeMillis = currentTimeMillis;
@@ -249,7 +258,9 @@ void sync_pin_monitoring_thread() {
 #endif
         }
         else if (val == 0 && previous_val == 1) { // Detecting fall transition (1 to 0)
-            zeroCrossCb();
+            
+        }else if (val == 1 && previous_val == 0) { // Detecting fall transition (1 to 0)
+            
         }
 
         previous_val = val; // Store the current value for the next iteration
@@ -314,6 +325,7 @@ int main() {
     setup_libgpiod();
 
     contextOutput[0].pin = O0_PIN;
+    contextOutput[0].value = 80;
     contextOutput[1].pin = O1_PIN;
     contextOutput[2].pin = O2_PIN;
     contextOutput[3].pin = O3_PIN;
@@ -324,10 +336,8 @@ int main() {
 
     contextInput[0].type = InputType::Rise;
     contextInput[0].map = 0;
-    contextInput[0].value = 200;
     contextInput[1].type = InputType::Fall;
     contextInput[1].map = 0;
-    contextInput[1].value = 200;
 
     contextInput[2].type = InputType::Multiway;
     contextInput[2].map = 1;
@@ -336,12 +346,12 @@ int main() {
     
     std::thread sync_monitor_thread(sync_pin_monitoring_thread);
     setThreadPriority(sync_monitor_thread, 5);  
-    
+    pastSyncUs = micros();
     while (run_monitoring) {
         HAL_input_sub_routine();
         HandlerInput_sub_routine();
         syncContext2Output();
-        std::this_thread::sleep_for(std::chrono::nanoseconds(5)); 
+        //std::this_thread::sleep_for(std::chrono::microseconds(5));
     }
 
     sync_monitor_thread.join();
